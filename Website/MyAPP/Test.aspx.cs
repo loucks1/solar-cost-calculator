@@ -1,4 +1,5 @@
-﻿using Newtonsoft.Json;
+﻿using LiteDB;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -6,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.Serialization.Formatters.Binary;
 using System.Text;
 using System.Threading.Tasks;
 using System.Web;
@@ -21,6 +23,8 @@ public partial class MyAPP_Test : System.Web.UI.Page
     private static String bearer = null;
     private static String name = null;
     private static String sensor = null;
+
+    private static String dataLocation = WebConfigurationManager.AppSettings["data_location"];
 
     private static async Task<String> PostFormUrlEncoded<TResult>(string url, IEnumerable<KeyValuePair<string, string>> postData)
     {
@@ -108,57 +112,116 @@ public partial class MyAPP_Test : System.Web.UI.Page
         public string sensorType { get; set; }
     }
 
-    private List<SampleResponse> getSamples(DateTime StartDate)
+    private List<SampleResponse> getSamples(DateTime startDate, DateTime endDate, LiteDatabase db)
     {
-        var response = new List<SampleResponse>();
-        var responseCount = 0;
-        int i = 1;
-        var retry = true;
-        var startDate = StartDate.ToUniversalTime().ToString("o");
-        var endDate = StartDate.AddMonths(1).ToUniversalTime().ToString("o");
-        var url = "https://api.neur.io/v1/samples?sensorId={0}&start={1}&end={2}&granularity=hours&perPage=500&page={3}";
-        while (retry)
+        var result = new List<SampleResponse>();
+        while (startDate <= endDate && startDate <= DateTime.Now)
         {
-            String resp =
-                 (Task.Run(async ()
-                        => await GetURL(String.Format(url, sensor, startDate, endDate, i), null)))
-                    .Result;
+            result.AddRange(getDailySample(startDate, db));
+            startDate = startDate.AddDays(1);
+        }
+        return result;
+    }
 
-            response.AddRange(JsonConvert.DeserializeObject<SampleResponse[]>(resp));
-            retry = responseCount != response.Count();
-            responseCount = response.Count();
-            i++;
+    private IEnumerable<SampleResponse> getDailySample(DateTime Date, LiteDatabase db)
+    {
+        var collectionName = Date.ToString("yyyyMMdd");
+
+        if (db.CollectionExists(collectionName))
+            return db.GetCollection<SampleResponse>(collectionName).FindAll();
+
+        var response = new List<SampleResponse>();
+
+        var url = "https://api.neur.io/v1/samples?sensorId={0}&start={1}&end={2}&granularity=hours&perPage=500";
+        String resp =
+             (Task.Run(async ()
+                    => await GetURL(String.Format(url, sensor, Date.ToUniversalTime().ToString("o"), Date.AddDays(1).ToUniversalTime().ToString("o")), null)))
+                .Result;
+
+        response.AddRange(JsonConvert.DeserializeObject<SampleResponse[]>(resp));
+        if (Date.AddDays(1) < DateTime.Now)
+        {
+            var collection = db.GetCollection<SampleResponse>(collectionName);
+            collection.InsertBulk(response);
         }
         return response;
     }
 
     protected void Page_LoadComplete(object sender, EventArgs e)
     {
-        object now = Session["StartMonth"];
-
         getSensorID();
 
-        if (now == null)
+        IEnumerable<SampleResponse> samples;
+
+        using (var db = new LiteDatabase(Path.Combine(dataLocation, sensor + ".db")))
         {
-            now = DateTime.SpecifyKind(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow,
-                            rateStructure.timeZone), DateTimeKind.Local);
-            now = DateTime.SpecifyKind(new DateTime(((DateTime)now).Year, ((DateTime)now).Month, 1), DateTimeKind.Local);
-            Session["StartMonth"] = now;
+            var cycle = db.GetCollection<BillingCycle>("BillingCycles");
+
+            DateTime startDate = DateTime.Now;
+            DateTime endDate = DateTime.Now;
+
+            var startOffset = 6;
+
+            BillingCycle billingCycle = null;
+
+            if (Session["Operation"] != null)
+            {
+                var cycles = cycle.FindAll().OrderBy(x => x.startDate).ToList();
+                var index = cycles.IndexOf(cycles.First(x => x.Id == (int)Session["lastCycleID"]));
+                switch (Session["Operation"].ToString())
+                {
+                    case "prev":
+                        if (index > 0) index--;
+                        break;
+                    case "next":
+                        if (index <= cycles.Count() - 2) index++;
+                        break;
+                }
+                Session["Operation"] = null;
+                billingCycle = cycles[index];
+            }
+            else
+            {
+                if (!DateTime.TryParse(TextBox1.Text, out startDate) || !DateTime.TryParse(TextBox2.Text, out endDate) || endDate <= startDate)
+                {
+                    var current = cycle.Find(x => x.endDate >= DateTime.Now && x.startDate <= DateTime.Now);
+                    if (current.Count() > 0)
+                    {
+                        billingCycle = current.First();
+                    }
+                    else
+                    {
+                        startDate = DateTime.SpecifyKind(TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow,
+                                        rateStructure.timeZone), DateTimeKind.Local);
+                        startDate = DateTime.SpecifyKind(new DateTime(((DateTime)startDate).Year, ((DateTime)startDate).Month, 1 + startOffset), DateTimeKind.Local);
+                        endDate = startDate.AddMonths(1);
+                    }
+                }
+                else
+                {
+                    startDate = DateTime.SpecifyKind(TimeZoneInfo.ConvertTimeToUtc(startDate, rateStructure.timeZone), DateTimeKind.Local);
+                    endDate = DateTime.SpecifyKind(TimeZoneInfo.ConvertTimeToUtc(endDate, rateStructure.timeZone), DateTimeKind.Local);
+                }
+            }
+
+            if (billingCycle != null)
+            {
+                startDate = billingCycle.startDate;
+                endDate = billingCycle.endDate;
+                Session["lastCycleID"] = billingCycle.Id;
+            }
+            TextBox1.Text = startDate.ToShortDateString();
+            TextBox2.Text = endDate.ToShortDateString();
+
+
+            Label1.Text = startDate.ToLocalTime().ToString("MMMM (MM/dd/yyyy - ") + endDate.ToLocalTime().ToString("MM/dd/yyyy)");
+
+            samples = getSamples(startDate, endDate, db);
+
+            if (cycle.Find(x => x.startDate == startDate && x.endDate == endDate).Count() == 0)
+                cycle.Insert(new BillingCycle { startDate = startDate, endDate = endDate });
         }
 
-        var startMonth = (DateTime)now;
-
-        var startOffset = 5;
-
-        var start = startMonth.AddDays(startOffset);
-
-        while (start > DateTime.Now)
-            start = start.AddMonths(-1);
-
-
-        Label1.Text = startMonth.ToLocalTime().ToString("MMMM");
-
-        var samples = getSamples(start);
 
         Table tbl = new Table { CellPadding = 40, HorizontalAlign = HorizontalAlign.Center };
 
@@ -172,11 +235,11 @@ public partial class MyAPP_Test : System.Web.UI.Page
         PlaceHolder1.Controls.Add(tbl);
         Label2.Text = String.Format("Total savings = {0:$0.00}", rateStructure.ratePeriods.Last().totalWithoutSolar - rateStructure.ratePeriods.First().totalWithSolar);
     }
+
     //watt second to kwh
     private static int conversionFactor = (1000 * 60 * 60);
 
-
-    private TableCell GetTable(bool IgnoreGeneration, RatePeriod[] ratePeriods, List<SampleResponse> samples, String title, ref Decimal totalCost, Decimal generationRate, Decimal fuelSurcharge)
+    private TableCell GetTable(bool IgnoreGeneration, RatePeriod[] ratePeriods, IEnumerable<SampleResponse> samples, String title, ref Decimal totalCost, Decimal generationRate, Decimal fuelSurcharge)
     {
         SampleResponse prevSample = samples.First();
 
@@ -270,8 +333,17 @@ public partial class MyAPP_Test : System.Web.UI.Page
         tc.Controls.Add(table);
         return tc;
     }
+
+    public class BillingCycle
+    {
+        public int Id { get; set; }
+        public DateTime startDate { get; set; }
+        public DateTime endDate { get; set; }
+    }
+
     public class SampleResponse
     {
+        public int Id { get; set; }
         public DateTime intervalTS { get; private set; }
         public UInt64 consumption { get; private set; }
         public UInt64 generation { get; private set; }
@@ -313,7 +385,7 @@ public partial class MyAPP_Test : System.Web.UI.Page
         ratePeriods = new RatePeriods[] {
         new RatePeriods{
             title = "Time of Day", 
-            generationRate = 0.029M,
+            generationRate = 0.0334M,
             fuelSurcharge =  .000535M,
             periods = new RatePeriod[] { 
                 new RatePeriod{rate = 0.07400M},
@@ -328,7 +400,7 @@ public partial class MyAPP_Test : System.Web.UI.Page
         },
         new RatePeriods{
             title = "Flat Rate", 
-            generationRate = 0.029M,
+            generationRate = 0.0334M,
             fuelSurcharge =  .000535M,
             periods = new RatePeriod[] { 
                 new RatePeriod{rate = 0.11663M},
@@ -399,15 +471,15 @@ public partial class MyAPP_Test : System.Web.UI.Page
 
     protected void Button1_Click(object sender, EventArgs e)
     {
-        object obj = Session["StartMonth"];
-        if (obj != null)
-            Session["StartMonth"] = ((DateTime)obj).AddMonths(-1);
-
+        Session["Operation"] = "prev";
     }
     protected void Button2_Click(object sender, EventArgs e)
     {
-        object obj = Session["StartMonth"];
-        if (obj != null)
-            Session["StartMonth"] = ((DateTime)obj).AddMonths(1);
+        Session["Operation"] = "next";
     }
+
+    protected void Button3_Click(object sender, EventArgs e)
+    {
+    }
+
 }
